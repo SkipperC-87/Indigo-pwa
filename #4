@@ -1,0 +1,161 @@
+import { createServer } from "http";
+import { WebSocketServer, WebSocket } from "ws";
+import * as fs from "fs/promises";
+import * as path from "path";
+
+const PORT = 8081;
+const DATA_DIR = "./data";
+const SESSIONS_DIR = path.join(DATA_DIR, "sessions");
+const PERSONA_FILE = path.join(DATA_DIR, "persona.json");
+const MATURE_URL = process.env.MATURE_MODEL_URL || "http://127.0.0.1:11434/api/chat";
+const MATURE_MODEL = process.env.MATURE_MODEL || "nous-hermes2";
+
+// ── Shared Session Types & Memory Store ──────────────────────────────────────
+
+type Turn = { role: "user" | "assistant"; content: string; ts: number; mode?: string };
+type SessionData = { sessionId: string; turns: Turn[]; facts: string[] };
+
+async function readSession(sessionId: string): Promise<SessionData> {
+  const safeId = sessionId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
+  const file = path.join(SESSIONS_DIR, `${safeId}.json`);
+  try {
+    return JSON.parse(await fs.readFile(file, "utf-8"));
+  } catch {
+    return { sessionId, turns: [], facts: [] };
+  }
+}
+
+async function writeSession(data: SessionData): Promise<void> {
+  await fs.mkdir(SESSIONS_DIR, { recursive: true });
+  const safeId = data.sessionId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
+  const file = path.join(SESSIONS_DIR, `${safeId}.json`);
+  const tmp = `${file}.tmp`;
+  await fs.writeFile(tmp, JSON.stringify(data, null, 2));
+  await fs.rename(tmp, file);
+}
+
+async function maybeStoreFact(sessionId: string, text: string): Promise<number> {
+  const patterns = [
+    /\bmy name is ([^.,!?]{2,30})/i,
+    /\bi live in ([^.,!?]{2,40})/i,
+    /\bi (like|hate) ([^.,!?]{3,50})/i
+  ];
+  const s = await readSession(sessionId);
+  let added = 0;
+  for (const p of patterns) {
+    const match = text.match(p);
+    if (match && !s.facts.includes(match[0])) {
+      s.facts.push(match[0]);
+      added++;
+    }
+  }
+  if (added) await writeSession(s);
+  return added;
+}
+
+async function buildSystemPrompt(sessionId: string, mode: string): Promise<string> {
+  const s = await readSession(sessionId);
+  let base = "You are Indigo, a warm, perceptive companion with full conversation continuity.";
+  if (mode === "mature") {
+    base += " The user enabled explicit mode. Match their tone while remaining in character.";
+  }
+  if (s.facts.length > 0) {
+    base += "\nKnown details about user:\n- " + s.facts.join("\n- ");
+  }
+  return base;
+}
+
+// ── Streaming Backend Processing ──────────────────────────────────────────────
+
+async function* streamMatureReply(sessionId: string, message: string) {
+  const sysPrompt = await buildSystemPrompt(sessionId, "mature");
+  const s = await readSession(sessionId);
+  const messages = [
+    { role: "system", content: sysPrompt },
+    ...s.turns.slice(-20).map(t => ({ role: t.role, content: t.content })),
+    { role: "user", content: message }
+  ];
+
+  const res = await fetch(MATURE_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: MATURE_MODEL, messages, stream: true })
+  });
+
+  if (!res.ok) throw new Error(`Model server error: ${res.statusText}`);
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop() ?? "";
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const chunk = JSON.parse(line);
+      if (chunk.message?.content) yield chunk.message.content;
+    }
+  }
+}
+
+async function* streamStandardReply(sessionId: string, message: string) {
+  const reply = `Received prompt: "${message}". Handled via standard engine route.`;
+  for (const char of reply.split("")) {
+    yield char;
+    await new Promise((r) => setTimeout(r, 15));
+  }
+}
+
+// ── Server Initializer ───────────────────────────────────────────────────────
+
+const server = createServer();
+const wss = new WebSocketServer({ server });
+
+wss.on("connection", (ws: WebSocket) => {
+  ws.on("message", async (raw: string) => {
+    try {
+      const msg = JSON.parse(String(raw));
+      if (!msg.sessionId) throw new Error("Missing sessionId");
+
+      const sid = msg.sessionId;
+      const mode = msg.mode === "mature" ? "mature" : "safe";
+      const userText = msg.kind === "image" ? (msg.caption || "Describe what you see.") : msg.message;
+      let reply = "";
+
+      ws.send(JSON.stringify({ type: "emotion", state: mode === "mature" ? "intimate" : "focused", intensity: 0.8 }));
+
+      const stream = mode === "mature" 
+        ? streamMatureReply(sid, userText)
+        : streamStandardReply(sid, userText);
+
+      for await (const token of stream) {
+        reply += token;
+        ws.send(JSON.stringify({ type: "token", text: token }));
+      }
+
+      const s = await readSession(sid);
+      s.turns.push({ role: "user", content: userText, ts: Date.now(), mode });
+      s.turns.push({ role: "assistant", content: reply, ts: Date.now(), mode });
+      await writeSession(s);
+
+      const stored = await maybeStoreFact(sid, userText);
+      ws.send(JSON.stringify({ type: "turn_end", reply, memoriesStored: stored }));
+    } catch (err: any) {
+      ws.send(JSON.stringify({ type: "error", message: err.message || "Execution error" }));
+    }
+  });
+});
+
+server.listen(PORT, "127.0.0.1", () => {
+  console.log(`Indigo local engine active on ws://127.0.0.1:${PORT}`);
+});
+
+[http://127.0.0.1:11434/api/chat](http://127.0.0.1:11434/api/
+
+
+// public/sw.js
+self.addEventListener('fetch', (event) => {
+  event.respondWith(fetch(event.request));
