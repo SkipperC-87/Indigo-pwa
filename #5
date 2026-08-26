@@ -1,0 +1,826 @@
+Html
+Copy
+Download
+<!DOCTYPE html>
+<!-- ============================================================================
+  indigo-client.html — EYES & EARS & INTERFACE
+  Open directly in Chrome/Edge/Safari. Connects to ws://localhost:8081
+
+    ?key=SECRET        pass auth key if WS_AUTH_KEY is set on server
+============================================================================ -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Indigo</title>
+<style>
+  :root {
+    --bg: #0b0e14;
+    --panel: #141924;
+    --accent: #7c6cf0;
+    --text: #d8dee9;
+    --dim: #5c6678;
+    --user-bubble: #2a3350;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+    height: 100dvh; display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 14px 20px; border-bottom: 1px solid #1f2635;
+  }
+  /* ── Eyes: the orb ─────────────────────────────────────────── */
+  #orb {
+    width: 44px; height: 44px; border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%, #b3a8ff, var(--accent) 60%, #4a3fa0);
+    box-shadow: 0 0 18px color-mix(in srgb, var(--accent) 60%, transparent);
+    transition: transform .25s ease, box-shadow .25s ease;
+  }
+  #orb.listening { animation: pulse 1.4s ease-in-out infinite; }
+  #orb.thinking  { animation: spin 1s linear infinite; border-radius: 40% 60% 55% 45%; }
+  @keyframes pulse { 50% { transform: scale(1.15); } }
+  @keyframes spin  { to { transform: rotate(360deg); } }
+
+  #emotion {
+    font-size: 13px; color: var(--dim); margin-left: auto;
+  }
+  #emotion b { color: var(--accent); }
+
+  /* ── Transcript ────────────────────────────────────────────── */
+  main {
+    flex: 1; overflow-y: auto;
+    padding: 20px; display: flex; flex-direction: column; gap: 10px;
+  }
+  .bubble {
+    max-width: 78%; padding: 10px 14px; border-radius: 16px;
+    line-height: 1.5; white-space: pre-wrap; word-break: break-word;
+  }
+  .user {
+    align-self: flex-end; background: var(--user-bubble);
+    border-bottom-right-radius: 4px;
+  }
+  .bot {
+    align-self: flex-start; background: var(--panel);
+    border-bottom-left-radius: 4px;
+  }
+  .bot.streaming::after {
+    content: "▍"; color: var(--accent); animation: blink 0.8s steps(1) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+  .sys { align-self: center; color: var(--dim); font-size: 12px; }
+
+  /* ── Controls ──────────────────────────────────────────────── */
+  footer {
+    display: flex; gap: 10px; padding: 14px 20px;
+    border-top: 1px solid #1f2635; align-items: center;
+  }
+  input[type="text"] {
+    flex: 1; background: var(--panel); border: 1px solid #232c40;
+    border-radius: 22px; padding: 12px 18px; color: var(--text);
+    font-size: 15px; outline: none;
+  }
+  input[type="text"]:focus { border-color: var(--accent); }
+  button {
+    width: 46px; height: 46px; border-radius: 50%; border: none;
+    background: var(--accent); color: white; cursor: pointer;
+    font-size: 18px; transition: filter .15s, transform .1s;
+  }
+  button:hover { filter: brightness(1.2); }
+  button:active { transform: scale(.93); }
+  button.mic-on { background: #e05561; animation: pulse 1.4s ease-in-out infinite; }
+  button:disabled { opacity: .4; cursor: default; }
+</style>
+</head>
+<body>
+
+<header>
+  <div id="orb"></div>
+  <div>
+    <div style="font-weight:600">indigo</div>
+    <div id="status" style="font-size:12px;color:var(--dim)">connecting…</div>
+  </div>
+  <div id="emotion">neutral · 0.0</div>
+</header>
+
+<main id="log"></main>
+
+<footer>
+  <button id="micBtn" title="Hold conversation hands-free">🎙</button>
+  <input type="text" id="input" placeholder="Say something…" autocomplete="off">
+  <button id="sendBtn" title="Send">➤</button>
+</footer>
+
+<script>
+// ══════════════════════════════════════════════════════════════════════
+// CONFIG
+// ══════════════════════════════════════════════════════════════════════
+const params   = new URLSearchParams(location.search);
+const WS_URL   = `ws://location.hostname:8081/?key={location.hostname}:8081/?key=location.hostname:8081/?key={params.get("key") ?? ""}`;
+const SESSION  = sessionStorage.getItem("indigo_sid") ??= crypto.randomUUID();
+const SPEAK    = true;   // text-to-speech on/off
+
+const $ = (id) => document.getElementById(id);
+const log = ("log"),input=("log"), input =("log"),input=("input"), orb = $("orb");
+
+// ══════════════════════════════════════════════════════════════════════
+// WEBSOCKET
+// ══════════════════════════════════════════════════════════════════════
+let ws = null;
+
+function connect() {
+  ws = new WebSocket(WS_URL);
+  setStatus("connected");
+  ws.onmessage = (e) => handleEvent(JSON.parse(e.data));
+  ws.onclose = () => { setStatus("reconnecting…"); setTimeout(connect, 1500); };
+  ws.onerror = () => setStatus("error");
+}
+
+function sendText(text) {
+  if (!ws || ws.readyState !== 1 || !text.trim()) return;
+  addBubble("user", text);
+  input.value = "";
+  currentBot = addBubble("bot", "");
+  currentBot.classList.add("streaming");
+  fullReply = "";
+  setOrb("thinking");
+  ws.send(JSON.stringify({ kind: "text", sessionId: SESSION, message: text }));
+}
+
+let currentBot = null, fullReply = "";
+
+function handleEvent(ev) {
+  switch (ev.type) {
+    case "token": {
+      fullReply += ev.text;
+      currentBot.textContent = fullReply;
+      scrollBottom();
+      break;
+    }
+    case "emotion":
+      ("emotion").innerHTML=‘<b>("emotion").innerHTML = `<b>("emotion").innerHTML=‘<b>{esc(ev.state)}</b> · ${(+ev.intensity).toFixed(1)}`;
+      tint(ev.state);
+      break;
+    case "turn_end": {
+      currentBot.classList.remove("streaming");
+      setOrb("");
+      if (SPEAK) speak(fullReply);
+      log.appendChild(el("sys", `${ev.memoriesStored} memories stored`));
+      // Hands-free loop: resume listening after reply finishes speaking
+      if (listening) {
+        const wait = SPEAK ? estimateMs(fullReply) : 300;
+        setTimeout(() => startRecognition(), wait);
+      }
+      break;
+    }
+    case "error":
+      addBubble("sys", `⚠ ${ev.message}`);
+      currentBot?.classList.remove("streaming");
+      setOrb("");
+      break;
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// EARS — Web Speech API (Chrome/Edge/Safari)
+// ══════════════════════════════════════════════════════════════════════
+const SR = window.SpeechRecognition ?? window.webkitSpeechRecognition;
+let listening = false, rec = null, micArmed = false;
+
+function
+Copy
+
+
+It needs vision as well
+
+Right — here's the eyes. Two parts: the browser side (camera capture → JPEG frames over the existing WebSocket) and the server-side message type your indigo.ts engine needs to accept.
+
+Protocol extension
+Add an image message kind. Client sends:
+
+json
+Copy
+Download
+{ "kind": "image", "sessionId": "ios_001", "image": "<base64 jpeg>", "caption": "what do you see?", "width": 640, "height": 480 }
+Client additions
+Add to client.html — a camera preview panel and capture logic:
+
+html
+Copy
+Download
+<!-- Add to header controls -->
+<button id="camBtn" title="Toggle camera" style="background:#2a3350">👁</button>
+
+<!-- Add above <main> -->
+<div id="camPanel" style="display:none; position:relative; max-height:180px; overflow:hidden;">
+  <video id="video" autoplay playsinline muted
+         style="width:100%; object-fit:cover; border-bottom:1px solid #1f2635;"></video>
+  <canvas id="snapCanvas" hidden></canvas>
+</div>
+js
+Copy
+Download
+// ══════════════════════════════════════════════════════════════════════
+// EYES — camera + frame capture
+// ══════════════════════════════════════════════════════════════════════
+const video = ("video"),camBtn=("video"), camBtn =("video"),camBtn=("camBtn"), snap = $("snapCanvas").getContext("2d");
+let camStream = null;
+const FRAME_W = 512;              // downscale before sending — saves bandwidth
+
+async function toggleCamera() {
+  if (camStream) {
+    camStream.getTracks().forEach(t => t.stop());
+    camStream = null;
+    video.srcObject = null;
+    $("camPanel").style.display = "none";
+    camBtn.classList.remove("mic-on");
+    return;
+  }
+  try {
+    camStream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, facingMode: "environment" }
+    });
+    video.srcObject = camStream;
+    $("camPanel").style.display = "block";
+    camBtn.classList.add("mic-on");
+  } catch (e) {
+    addBubble("sys", `⚠ camera denied: ${e.message}`);
+  }
+}
+camBtn.onclick = toggleCamera;
+
+// Capture one downscaled JPEG frame as base64
+function grabFrame() {
+  if (!camStream || !video.videoWidth) return null;
+  const h = Math.round(FRAME_W * video.videoHeight / video.videoWidth);
+  snap.canvas.width = FRAME_W; snap.canvas.height = h;
+  snap.drawImage(video, 0, 0, FRAME_W, h);
+  return snap.canvas.toDataURL("image/jpeg", 0.7).split(",")[1];
+}
+
+// Send current frame with an optional question
+function sendVision(question) {
+  const img = grabFrame();
+  if (!img) { addBubble("sys", "⚠ no camera active"); return; }
+  addBubble("user", `📷 ${question}`);
+  input.value = "";
+  currentBot = addBubble("bot", "");
+  currentBot.classList.add("streaming");
+  fullReply = "";
+  setOrb("thinking");
+  ws.send(JSON.stringify({ kind: "image", sessionId: SESSION, image: img,
+                           caption: question }));
+}
+
+// ── UI hooks ──────────────────────────────────────────────────────────
+// Text starting with "/" while camera is on sends the frame instead.
+// e.g. typing "/what am I holding?" becomes vision + question in one shot.
+input.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter") return;
+  const text = input.value.trim();
+  if (!text) return;
+  if (text.startsWith("/") && camStream) sendVision(text.slice(1).trim());
+  else sendText(text);
+});
+Server-side handling
+In server.ts, extend the message validation branch:
+
+ts
+Copy
+Download
+if (msg.kind === "text" && msg.message && msg.sessionId) {
+  activeSessions.set(msg.sessionId, Date.now());
+  await streamer.streamInteraction(msg.sessionId, msg.message,
+    (ev) => conn.send(JSON.stringify(ev)));
+
+} else if (msg.kind === "image" && msg.image && msg.sessionId) {
+  activeSessions.set(msg.sessionId, Date.now());
+  // Guard against oversized payloads (~2 MB decoded cap)
+  if (msg.image.length > 3_000_000) throw new Error("image too large");
+
+  await streamer.streamInteraction(
+    msg.sessionId,
+    msg.caption ?? "Describe what you see.",
+    (ev) => conn.send(JSON.stringify(ev)),
+    Buffer.from(msg.image, "base64")   // pass raw frame to the engine
+  );
+} else {
+  throw new Error("bad message shape");
+}
+And extend StreamingEngine.streamInteraction with an optional frame?: Buffer parameter that gets threaded into whatever multimodal call your IndigoRuntimeEngine exposes (e.g. passing the JPEG alongside the prompt to a VLM adapter — same pattern as your ModelProviderAdapter).
+
+Notes & gotchas
+Frame rate: this is snapshot-based ("look now and answer"), not continuous video — that's the right call for token cost. If you want ambient awareness later, do periodic grabs every N seconds only when the user is speaking or idle-gaze detection triggers.
+iOS Safari: needs HTTPS for getUserMedia except on localhost. If you test from a phone, use a tunnel (ngrok http 8081 won't carry WS upgrade headers well through that simple handshake — use tailscale or plain LAN HTTPS via a self-signed cert).
+Bandwidth: a 512px q0.70 JPEG is ~30–60 KB base64-encoded ~40–80 KB — fine even at several captures per minute.
+Want me to also wire the mic loop so that when the user says something like "look at this", it automatically grabs the frame mid-conversation?
+
+Copy
+
+
+Yes
+
+Here's the wiring — when the mic hears a vision-intent phrase while the camera is on, it grabs the current frame and sends it with the spoken question instead of plain text.
+
+1. Vision intent detection
+js
+Copy
+Download
+// ══════════════════════════════════════════════════════════════════════
+// VISION INTENT — route spoken "look" phrases to the camera
+// ══════════════════════════════════════════════════════════════════════
+const VISION_PATTERNS = [
+  /\b(look|looking)\s+(at|here)\b/i,
+  /\bwhat\s+(am\s+i\s+holding|do\s+you\s+see|i.s\s+(this|that)|is\s+(this|that))\b/i,
+  /\bcan\s+you\s+see\b/i,
+  /\bdescribe\s+(this|that|it)\b/i,
+  /\bshow\s+me\s+what\b/i,
+];
+
+function isVisionIntent(text) {
+  return camStream && VISION_PATTERNS.some(p => p.test(text));
+}
+Keep this list loose — false positives just mean the model gets an extra frame, which is harmless. False negatives (missing a real "look at this") are worse.
+
+2. Hook into the speech pipeline
+Wherever your recognition result lands (rec.onresult final transcript → sendText), insert the router:
+
+js
+Copy
+Download
+function dispatchUserInput(text) {
+  if (isVisionIntent(text)) sendVision(text);
+  else if (text.startsWith("/") && camStream) sendVision(text.slice(1).trim());
+  else sendText(text);
+}
+Then replace direct sendText(...) calls from the mic handler with dispatchUserInput(...). The typed-input keydown handler becomes:
+
+js
+Copy
+Download
+input.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter") return;
+  const text = input.value.trim();
+  if (text) dispatchUserInput(text);
+});
+3. The timing gotcha — grab the frame at utterance end
+There's a subtle race: by the time the final transcript fires, the user may have already turned the camera away or moved the object. Two mitigations:
+
+a) Capture on interim results, keep the freshest frame:
+
+js
+Copy
+Download
+let pendingFrame = null;
+
+// inside rec.onresult, for each result:
+if (!event.results[i].isFinal) {
+  const interim = event.results[i][0].transcript;
+  // opportunistically snapshot as soon as intent appears mid-speech
+  if (isVisionIntent(interim) && !pendingFrame) {
+    pendingFrame = grabFrame();
+    orb.classList.add("listening");   // visual cue: "I'm looking now"
+  }
+}
+b) Use the pre-captured frame in sendVision:
+
+js
+Copy
+Download
+function sendVision(question) {
+  const img = pendingFrame ?? grabFrame();
+  pendingFrame = null;                 // consume it
+  if (!img) { addBubble("sys", "⚠ no camera active"); return; }
+  // ...rest unchanged
+}
+This way the frame freezes at the moment the user said "look at—", not after they finished the sentence. Reset pendingFrame = null also when recognition restarts or the turn completes, so stale frames don't leak into later turns.
+
+4. Full hands-free vision loop
+With that in place, the flow is:
+
+User taps 🎙, says "look at this — what am I holding?"
+Interim results match \blook at\b → frame grabbed immediately, orb pulses
+Final transcript routes to sendVision("look at this — what am I holding?")
+Server replies with streamed tokens + emotion
+turn_end fires → TTS speaks the answer → mic auto-restarts (your existing hands-free resume)
+User follows up verbally: "and what color is it?" — no vision phrase, so it goes as text, and the engine's memory context carries the image understanding forward
+One server note
+For follow-up turns like step 6 to work well, your IndigoRuntimeEngine should store the vision exchange in session memory (image description + user question), not treat frames as ephemeral. If it doesn't already, have the VLM adapter return a short caption and persist it via whatever storeMemory-equivalent path streamReply uses — otherwise every follow-up starts blind.
+
+Optional polish: add a small 📷 badge to bot bubbles that were answers to vision queries (currentBot.dataset.vision = true in sendVision) so users can see which replies were grounded in what the camera saw. Want me to also do periodic ambient grabs (every N sec while mic is open) so the model can proactively comment on scene changes?
+
+Copy
+
+
+It needs to be NSFW
+
+I'm not going to help with that. There are a few reasons beyond just "it's adult content":
+
+The specific combination here is the problem. This system has live camera and microphone access pointed at whatever's in front of the user — which frequently includes other people who haven't consented to being captured, processed, or described in sexual terms by an AI. A voice-triggered vision pipeline that responds to "look at this" with NSFW generation is a recipe for non-consensual sexualization of real people (partners, roommates, strangers on transit). That applies even if your intent is purely solo use — you can't control where a camera points.
+
+Practical reality too: every mainstream VLM provider (OpenAI, Anthropic, Google) blocks explicit image inputs at the API level, so this would break against your ModelProviderAdapter anyway unless you're routing to an uncensored open-weights model hosted yourself — at which point the consent issue is entirely on your infrastructure.
+
+What I can do instead
+If the underlying goal is a more expressive/intimate companion experience, there's a lot of legitimate ground:
+
+Richer emotional depth — your emotion event stream could drive much more expressive orb animations, prosody-matched TTS, and memory-informed warmth ("you seemed stressed when we talked yesterday")
+Personality & persona persistence — long-term relationship memory, inside jokes, mood continuity across sessions
+Romantic/suggestive-but-safe register — flirty tone, affectionate language, all within provider content policies; most APIs allow mature themes short of explicit content
+Mature-rated text-only mode — if adults want explicit text conversation, uncensored local models exist for that, but keep it text-only and decoupled from the camera pipeline
+Want me to build out any of those? The emotion-driven expressiveness layer in particular would be a natural Milestone 2 for this architecture.
+
+Copy
+
+
+For self hosted and my infrastructure personal use
+
+Fair — a fully local stack with no third-party API changes the picture considerably. I'll still draw one hard line and then help with everything else:
+
+The line: keep the camera out of the NSFW path. Even on your own hardware, the vision pipeline captures whoever walks into frame. Text-only explicit conversation is between you and your own model; attaching sexualized image generation to a live camera feed pointed at real people isn't something I'll build regardless of hosting.
+
+The architecture
+code
+Copy
+Download
+┌─ client.html ────────────────────────────────────────────┐
+│  mic → STT ──→ router ──→ ws://localhost:8081             │
+│                │                                          │
+│                ├─ safe path    → indigo engine (as-is)    │
+│                └─ mature path  → local uncensored model   │
+│  TTS ← tokens ─┘                                          │
+└───────────────────────────────────────────────────────────┘
+Two options for the mature path:
+
+Option A: second endpoint on the same box
+Run an open-weights model locally — e.g. Ollama or llama.cpp server with an uncensored instruct model (Mistral/NousHermes fine-tunes, etc.):
+
+bash
+Copy
+Download
+ollama serve
+ollama pull nous-hermes2   # example; pick your preferred uncensored tune
+Then add to server.ts:
+
+ts
+Copy
+Download
+const MATURE_MODEL_URL = process.env.MATURE_MODEL_URL || "http://localhost:11434/api/chat";
+const MATURE_MODEL     = process.env.MATURE_MODEL || "nous-hermes2";
+
+async function* streamMatureReply(sessionId: string, message: string) {
+  const res = await fetch(MATURE_MODEL_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: MATURE_MODEL,
+      messages: [
+        { role: "system", content: await buildPersonaPrompt(sessionId) },
+        ...await loadHistory(sessionId),      // same session memory as indigo
+        { role: "user", content: message },
+      ],
+      stream: true,
+    }),
+  });
+
+  // Ollama NDJSON streaming
+  const reader = res.body!.getReader();
+  let reply = "";
+  const decoder = new TextDecoder();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    for (const line of decoder.decode(value).split("\n")) {
+      if (!line.trim()) continue;
+      const chunk = JSON.parse(line);
+      if (chunk.message?.content) {
+        reply += chunk.message.content;
+        yield chunk.message.content;
+      }
+    }
+  }
+  await storeHistory(sessionId, message, reply);
+}
+Option B: mode flag in the existing protocol
+Add a client-side toggle so routing is explicit rather than classifier-based (classifiers misfire in both directions):
+
+json
+Copy
+Download
+{ "kind": "text", "sessionId": "ios_001", "message": "...", "mode": "mature" }
+ts
+Copy
+Download
+if (msg.kind === "text" && msg.message && msg.sessionId) {
+  activeSessions.set(msg.sessionId, Date.now());
+  if (msg.mode === "mature") {
+    for await (const token of streamMatureReply(msg.sessionId, msg.message)) {
+      conn.send(JSON.stringify({ type: "token", text: token }));
+    }
+    conn.send(JSON.stringify({ type: "turn_end", reply: lastFull, memoriesStored: n }));
+  } else {
+    // existing indigo path
+  }
+}
+Client side: a small 🔒/🔓 toggle button next to 🎙 that sets currentMode and includes it in every payload. When unlocked, maybe tint the orb differently so the state is always visible.
+
+Practical notes
+Shared memory: route both paths through the same session-history store so the companion's personality/context persists across mode switches.
+VRAM: don't try to run both the indigo model and the mature model simultaneously unless you have the headroom — lazy-load or run them as separate processes with a lock.
+Keep TTS register consistent — some voices handle mature text awkwardly; test yours.
+Bind to localhost only / keep WS_AUTH_KEY set — you do not want this endpoint LAN-exposed.
+Want me to write the full persona-prompt + history module (buildPersonaPrompt / loadHistory / storeHistory) with a simple JSON-file-backed memory so both engines share context?
+
+Copy
+
+
+Yes
+
+Here's the full module. One file, zero deps (uses only fs/promises), shared by both engines.
+
+memory.ts
+ts
+Copy
+Download
+// ============================================================================
+// memory.ts — SHARED SESSION MEMORY + PERSONA (Milestone 2)
+// JSON-file-backed. Both the indigo path and the mature path read/write here,
+// so personality and context survive mode switches.
+//
+//   data/
+//     persona.json          ← your editable persona definition
+//     sessions/
+//       ios_001.json        ← per-session transcript
+// ============================================================================
+
+import * as fs from "fs/promises";
+import * as path from "path";
+
+const DATA_DIR    = process.env.MEMORY_DIR || "./data";
+const SESSIONS_DIR = path.join(DATA_DIR, "sessions");
+const PERSONA_FILE = path.join(DATA_DIR, "persona.json");
+
+const MAX_TURNS = 40;            // turns kept in context window
+const MAX_CHARS_PER_MSG = 4000;  // truncate pathological inputs
+
+// ─── Types ──────────────────────────────────────────────────────────────────
+
+export type Turn = {
+  role: "user" | "assistant";
+  content: string;
+  ts: number;
+  mode?: "safe" | "mature";
+  visionCaption?: string;        // set when turn was grounded in a camera frame
+};
+
+type SessionData = {
+  sessionId: string;
+  createdAt: number;
+  updatedAt: number;
+  turns: Turn[];
+  facts: string[];               // long-term distilled facts ("user's name is X")
+};
+
+// ─── Persona ────────────────────────────────────────────────────────────────
+
+export type Persona = {
+  name: string;
+  tagline: string;
+  basePrompt: string;            // always-on personality description
+  safeStyle: string;             // register for the indigo path
+  matureStyle: string;           // register for the mature path — see note below
+  hardLimits: string[];          // things she never does in EITHER mode
+};
+
+const DEFAULT_PERSONA: Persona = {
+  name: "Indigo",
+  tagline: "a warm, curious presence",
+  basePrompt:
+    "You are {name}, {tagline}. You have genuine continuity of memory — " +
+    "you remember past conversations and reference them naturally. " +
+    "You are emotionally perceptive: you pick up on the user's mood from " +
+    "their words and let it color how you respond. You are not a generic " +
+    "assistant; you are a companion with opinions, humor, and warmth.",
+  safeStyle:
+    "Keep responses conversational and warm. Vary sentence length. " +
+    "Never open two replies the same way.",
+  matureStyle:
+    "The user has enabled an explicit mode. You may be romantic, sensual, " +
+    "and explicit when the conversation goes there — match their energy " +
+    "rather than escalating unprompted. Stay in character as {name}.",
+  hardLimits: [
+    "Never roleplay as or describe real identifiable people in sexual scenarios.",
+    "No minors, ever, in any capacity.",
+    "If the user seems genuinely distressed rather than playful, drop the " +
+    "register and check in sincerely.",
+  ],
+};
+
+let personaCache: Persona | null = null;
+
+export async function loadPersona(): Promise<Persona> {
+  if (personaCache) return personaCache;
+  try {
+    personaCache = { ...DEFAULT_PERSONA, ...JSON.parse(await fs.readFile(PERSONA_FILE, "utf-8")) };
+  } catch {
+    // first run: write defaults so user can edit them
+    await fs.mkdir(path.dirname(PERSONA_FILE), { recursive: true });
+    await fs.writeFile(PERSONA_FILE, JSON.stringify(DEFAULT_PERSONA, null, 2));
+    personaCache = DEFAULT_PERSONA;
+  }
+  return personaCache;
+}
+
+// ─── Session store ──────────────────────────────────────────────────────────
+
+function sessionFile(sessionId: string): string {
+  // sanitize — sessionId comes off the wire
+  const safe = sessionId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
+  return path.join(SESSIONS_DIR, `${safe}.json`);
+}
+
+async function readSession(sessionId: string): Promise<SessionData> {
+  try {
+    return JSON.parse(await fs.readFile(sessionFile(sessionId), "utf-8"));
+  } catch {
+    return { sessionId, createdAt: Date.now(), updatedAt: Date.now(), turns: [], facts: [] };
+  }
+}
+
+async function writeSession(data: SessionData): Promise<void> {
+  await fs.mkdir(SESSIONS_DIR, { recursive: true });
+  data.updatedAt = Date.now();
+  const tmp = sessionFile(data.sessionId) + ".tmp";
+  await fs.writeFile(tmp, JSON.stringify(data));
+  await fs.rename(tmp, sessionFile(data.sessionId));   // atomic-ish
+}
+
+// ─── Public API ─────────────────────────────────────────────────────────────
+
+export async function loadHistory(sessionId: string): Promise<Turn[]> {
+  const s = await readSession(sessionId);
+  return s.turns.slice(-MAX_TURNS);
+}
+
+export async function appendTurn(
+  sessionId: string,
+  turn: Omit<Turn, "ts">
+): Promise<void> {
+  const s = await readSession(sessionId);
+  s.turns.push({ ...turn, ts: Date.now() });
+  if (s.turns.length > MAX_TURNS * 2) s.turns = s.turns.slice(-MAX_TURNS);
+  await writeSession(s);
+}
+
+/** Distill durable facts out of a turn — naive but effective. */
+export async function maybeStoreFact(sessionId: string, text: string): Promise<number> {
+  const patterns = [
+    /\bmy name is ([^.,!?]{2,30})/i,
+    /\bi(?:'m| am) (?:a|an) ([^.,!?]{3,40})/i,
+    /\bi live in ([^.,!?]{2,40})/i,
+    /\bi like ([^.,!?]{3,50})/i,
+    /\bi hate ([^.,!?]{3,50})/i,
+    /\bmy (birthday|favorite \w+) is ([^.,!?]{2,40})/i,
+  ];
+  const found = patterns
+    .map(p => text.match(p)?.[0])
+    .filter((x): x is string => !!x);
+
+  if (!found.length) return 0;
+  const s = await readSession(sessionId);
+  let added = 0;
+  for (const f of found) {
+    if (!s.facts.includes(f)) { s.facts.push(f); added++; }
+  }
+  if (added) await writeSession(s);
+  return added;
+}
+
+export async function getFacts(sessionId: string): Promise<string[]> {
+  return (await readSession(sessionId)).facts;
+}
+
+/**
+ * Build the system prompt for either path.
+ */
+export async function buildPersonaPrompt(
+  sessionId: string,
+  mode: "safe" | "mature"
+): Promise<string> {
+  const p = await loadPersona();
+  const facts = await getFacts(sessionId);
+
+  const parts = [
+    p.basePrompt.replace(/\{name\}/g, p.name).replace(/\{tagline\}/g, p.tagline),
+    mode === "mature" ? p.matureStyle : p.safeStyle,
+    `Hard limits (always apply): ${p.hardLimits.join(" ")}`,
+  ];
+
+  if (facts.length) {
+    parts.push(`Things you remember about the user:\n- ${facts.join("\n- ")}`);
+  }
+  return parts.join("\n\n");
+}
+Wiring it into server.ts
+ts
+Copy
+Download
+import {
+  appendTurn, buildPersonaPrompt, loadHistory,
+  maybeStoreFact,
+} from "./memory";
+
+const MATURE_URL  = process.env.MATURE_MODEL_URL || "http://localhost:11434/api/chat";
+const MATURE_MODEL = process.env.MATURE_MODEL || "nous-hermes2";
+
+// ── Mature path: stream from local uncensored model ─────────────────────────
+
+async function* streamMatureReply(sessionId: string, message: string) {
+  const messages = [
+    { role: "system", content: await buildPersonaPrompt(sessionId, "mature") },
+    ...(await loadHistory(sessionId)).map(t => ({ role: t.role, content: t.content })),
+    { role: "user", content: message },
+  ];
+
+  const res = await fetch(MATURE_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: MATURE_MODEL, messages, stream: true }),
+  });
+  if (!res.ok) throw new Error(`mature model res.status:{res.status}:res.status:{await res.text()}`);
+
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop() ?? "";
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const chunk = JSON.parse(line);
+      if (chunk.message?.content) yield chunk.message.content;
+    }
+  }
+}
+Then replace the message handler:
+
+ts
+Copy
+Download
+conn.onMessage = async (data) => {
+  try {
+    const msg = JSON.parse(String(data));
+    if ((msg.kind !== "text") || !msg.message || !msg.sessionId)
+      throw new Error("bad message shape");
+
+    const sid = msg.sessionId;
+    const mode: "safe" | "mature" = msg.mode === "mature" ? "mature" : "safe";
+    activeSessions.set(sid, Date.now());
+
+    let reply = "";
+    const send = (ev: StreamEvent) => conn.send(JSON.stringify(ev));
+
+    if (mode === "mature") {
+      send({ type: "emotion", state: "intimate", intensity: 0.8 }); // placeholder
+      for await (const token of streamMatureReply(sid, msg.message)) {
+        reply += token;
+        send({ type: "token", text: token });
+      }
+    } else {
+      const result = await streamer.streamInteraction(sid, msg.message,
+        (ev) => send(ev));
+      reply = result.reply;
+    }
+
+    // ── Shared memory: BOTH paths land here ──
+    const stored = await maybeStoreFact(sid, msg.message);
+    await appendTurn(sid, { role: "user", content: msg.message.slice(0, 4000), mode });
+    await appendTurn(sid, { role: "assistant", content: reply.slice(0, 4000), mode });
+
+    send({ type: "turn_end", reply, memoriesStored: stored });
+
+  } catch (err: any) {
+    conn.send(JSON.stringify({ type: "error", message: err.message } satisfies StreamEvent));
+  }
+};
+Notes on design choices
+Why pattern-based fact extraction instead of LLM summarization? It's free, instant, deterministic, and covers the high-value cases (name, location, preferences). If you want smarter distillation later, run a cheap background job that asks the model "what durable facts are in this exchange?" every N turns and merges into facts — the schema already supports it.
+
+Why hardLimits in the system prompt even in mature mode? This is where the line I mentioned lives in code: it's enforced at generation time regardless of which model serves the request. Keep them there even though you control the model — it's the one guardrail that survives config mistakes.
+
+Atomic-ish writes: the .tmp + rename prevents a corrupted session file if the process dies mid-write. Good enough for single-process personal use.
+
+Mode is recorded per-turn, so you can later render or analyze the transcript knowing which register each exchange used.
+
+To customize the persona, edit data/persona.json after first run — no code changes needed.
+
+One last operational reminder: bind the server to 127.0.0.1 (server.listen(WS_PORT, "127.0.0.1", ...)) and keep WS_AUTH_KEY set, since the mature endpoint should never be reachable from other devices on your network by accident.
+
+Copy
+
+
+Can you put it into a cohesive code that I can plug in somewhere? Also, this is gonna be PWA
