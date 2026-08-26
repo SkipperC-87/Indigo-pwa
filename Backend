@@ -1,0 +1,779 @@
+1. Backend Engine Route Setup: Update ⁠server.ts⁠ to ensure ⁠ws.send⁠ payload strings do not fail type-checking if strict TypeScript flags are enabled. Ensure you have installed the server dependencies:
+
+Once Ollama is running locally and the server is started with ⁠npx ts-node server.ts⁠, navigate to ⁠http://localhost:8081⁠ (or serve ⁠index.html⁠ via a local static server like ⁠npx serve public⁠) to run the system.
+
+
+npm install ws @types/ws @types/node
+
+Here is a complete, self-contained implementation packaged into four production-ready files. This includes Web Speech API voice control, camera frame snapshots, custom memory storage, PWA installation support, and seamless streaming via Ollama.
+Project File Tree
+Create a directory on your machine with this exact structure: indigo-pwa/
+├── data/                    (auto-created on runtime)
+├── public/
+│   ├── index.html
+│   ├── manifest.json
+│   └── sw.js
+├── package.json
+└── server.ts
+
+1. ⁠package.json⁠
+Run ⁠npm install⁠ inside your project directory to install dependencies. {
+  "name": "indigo-pwa",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node --loader ts-node/esm server.ts"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/ws": "^8.5.10",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3"
+  }
+}
+
+2. ⁠public/manifest.json⁠
+Web App Manifest required for standalone installation on desktop and mobile browsers. {
+  "short_name": "Indigo",
+  "name": "Indigo Assistant PWA",
+  "start_url": "/",
+  "background_color": "#0b0e14",
+  "theme_color": "#0b0e14",
+  "display": "standalone",
+  "icons": [
+    {
+      "src": "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='40' fill='%237c6cf0'/></svg>",
+      "sizes": "192x192 512x512",
+      "type": "image/svg+xml"
+    }
+  ]
+}
+
+3. ⁠public/sw.js⁠
+Service Worker handling cache-falling-back-to-network strategy for true offline PWA functionality. const CACHE_NAME = 'indigo-v1';
+const ASSETS = ['/', '/index.html', '/manifest.json'];
+
+self.addEventListener('install', (event) => {
+  event.waitUntil(
+    caches.open(CACHE_NAME).then((cache) => cache.addAll(ASSETS))
+  );
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    caches.keys().then((keys) =>
+      Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k)))
+    )
+  );
+  self.clients.claim();
+});
+
+self.addEventListener('fetch', (event) => {
+  if (event.request.method !== 'GET') return;
+  event.respondWith(
+    caches.match(event.request).then((cached) => cached || fetch(event.request))
+  );
+});
+const CACHE_NAME = 'indigo-v1';
+const ASSETS = ['/', '/index.html', '/manifest.json'];
+
+self.addEventListener('install', (event) => {
+  event.waitUntil(
+    caches.open(CACHE_NAME).then((cache) => cache.addAll(ASSETS))
+  );
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    caches.keys().then((keys) =>
+      Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k)))
+    )
+  );
+  self.clients.claim();
+});
+
+self.addEventListener('fetch', (event) => {
+  if (event.request.method !== 'GET') return;
+  event.respondWith(
+    caches.match(event.request).then((cached) => cached || fetch(event.request))
+  );
+});
+
+4. ⁠public/index.html⁠
+The complete PWA user interface. Handles continuous speech, camera snapshots, text input, mode switching (safe vs. uncensored), and incoming message streams. <!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#0b0e14">
+<title>Indigo PWA</title>
+<style>
+  :root {
+    --bg: #0b0e14;
+    --panel: #141924;
+    --accent: #7c6cf0;
+    --text: #d8dee9;
+    --dim: #5c6678;
+    --user-bubble: #2a3350;
+    --danger: #e05561;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+    height: 100dvh; display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 14px 20px; border-bottom: 1px solid #1f2635;
+  }
+  #orb {
+    width: 40px; height: 40px; border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%, #b3a8ff, var(--accent) 60%, #4a3fa0);
+    box-shadow: 0 0 18px color-mix(in srgb, var(--accent) 60%, transparent);
+    transition: transform .25s ease, box-shadow .25s ease;
+  }
+  #orb.listening { animation: pulse 1.4s ease-in-out infinite; }
+  #orb.thinking  { animation: spin 1s linear infinite; border-radius: 40% 60% 55% 45%; }
+  @keyframes pulse { 50% { transform: scale(1.15); } }
+  @keyframes spin  { to { transform: rotate(360deg); } }
+
+  #emotion { font-size: 13px; color: var(--dim); margin-left: auto; }
+  #emotion b { color: var(--accent); }
+
+  #camPanel {
+    display: none; position: relative; max-height: 200px; overflow: hidden;
+    background: #000; border-bottom: 1px solid #1f2635;
+  }
+  #video { width: 100%; height: 200px; object-fit: cover; }
+
+  main {
+    flex: 1; overflow-y: auto; padding: 20px; display: flex;
+    flex-direction: column; gap: 10px;
+  }
+  .bubble {
+    max-width: 80%; padding: 10px 14px; border-radius: 16px;
+    line-height: 1.5; white-space: pre-wrap; word-break: break-word;
+  }
+  .user { align-self: flex-end; background: var(--user-bubble); border-bottom-right-radius: 4px; }
+  .bot { align-self: flex-start; background: var(--panel); border-bottom-left-radius: 4px; }
+  .bot.streaming::after {
+    content: "▍"; color: var(--accent); animation: blink 0.8s steps(1) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+  .sys { align-self: center; color: var(--dim); font-size: 12px; }
+
+  footer {
+    display: flex; gap: 8px; padding: 14px 20px;
+    border-top: 1px solid #1f2635; align-items: center;
+  }
+  input[type="text"] {
+    flex: 1; background: var(--panel); border: 1px solid #232c40;
+    border-radius: 22px; padding: 12px 18px; color: var(--text);
+    font-size: 15px; outline: none;
+  }
+  input[type="text"]:focus { border-color: var(--accent); }
+  button {
+    width: 42px; height: 42px; border-radius: 50%; border: none;
+    background: var(--panel); color: white; cursor: pointer;
+    font-size: 16px; transition: filter .15s, transform .1s, background .2s;
+    display: flex; align-items: center; justify-content: center;
+  }
+  button:hover { filter: brightness(1.2); }
+  button:active { transform: scale(.93); }
+  button.active { background: var(--accent); }
+  button.mic-on { background: var(--danger); animation: pulse 1.4s ease-in-out infinite; }
+  button:disabled { opacity: .4; cursor: default; }
+</style>
+</head>
+<body>
+
+<header>
+  <div id="orb"></div>
+  <div>
+    <div style="font-weight:600">indigo</div>
+    <div id="status" style="font-size:12px;color:var(--dim)">connecting…</div>
+  </div>
+  <div id="emotion">neutral · 0.0</div>
+</header>
+
+<div id="camPanel">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="snapCanvas" hidden></canvas>
+</div>
+
+<main id="log"></main>
+
+<footer>
+  <button id="camBtn" title="Toggle Camera">👁</button>
+  <button id="micBtn" title="Toggle Mic">🎙</button>
+  <button id="modeBtn" title="Toggle Mode (Safe / Mature)">🔒</button>
+  <input type="text" id="input" placeholder="Say something..." autocomplete="off">
+  <button id="sendBtn" style="background:var(--accent)" title="Send">➤</button>
+</footer>
+
+<script>
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js').catch(() => {});
+  });
+}
+
+const params = new URLSearchParams(location.search);
+const host = location.hostname || "localhost";
+const WS_URL = `ws://${host}:8081/?key=${encodeURIComponent(params.get("key") ?? "")}`;
+const SESSION = sessionStorage.getItem("indigo_sid") ?? crypto.randomUUID();
+sessionStorage.setItem("indigo_sid", SESSION);
+
+const $ = (id) => document.getElementById(id);
+const logEl = $("log");
+const inputEl = $("input");
+const orb = $("orb");
+const statusEl = $("status");
+const emotionEl = $("emotion");
+const video = $("video");
+const snapCanvas = $("snapCanvas");
+
+let ws = null;
+let currentBot = null, fullReply = "";
+let currentMode = "safe";
+let camStream = null;
+let listening = false, rec = null;
+let pendingFrame = null;
+const FRAME_W = 512;
+
+const VISION_PATTERNS = [
+  /\b(look|looking)\s+(at|here)\b/i,
+  /\bwhat\s+(am\s+i\s+holding|do\s+you\s+see|is\s+(this|that))\b/i,
+  /\bcan\s+you\s+see\b/i,
+  /\bdescribe\s+(this|that|it)\b/i
+];
+
+function setStatus(txt) { statusEl.textContent = txt; }
+function setOrb(cls) { orb.className = cls; }
+function esc(str) { return String(str).replace(/[&<>"']/g, ""); }
+function scrollBottom() { logEl.scrollTop = logEl.scrollHeight; }
+
+function addBubble(type, text) {
+  const div = document.createElement("div");
+  div.className = `bubble ${type}`;
+  div.textContent = text;
+  logEl.appendChild(div);
+  scrollBottom();
+  return div;
+}
+
+function connect() {
+  ws = new WebSocket(WS_URL);
+  ws.onopen = () => setStatus("connected");
+  ws.onmessage = (e) => handleEvent(JSON.parse(e.data));
+  ws.onclose = () => { setStatus("reconnecting..."); setTimeout(connect, 1500); };
+  ws.onerror = () => setStatus("error");
+}
+
+function grabFrame() {
+  if (!camStream || !video.videoWidth) return null;
+  const ctx = snapCanvas.getContext("2d");
+  const h = Math.round(FRAME_W * video.videoHeight / video.videoWidth);
+  snapCanvas.width = FRAME_W; 
+  snapCanvas.height = h;
+  ctx.drawImage(video, 0, 0, FRAME_W, h);
+  return snapCanvas.toDataURL("image/jpeg", 0.7).split(",")[1];
+}
+
+function dispatchUserInput(text) {
+  const isVision = camStream && VISION_PATTERNS.some(p => p.test(text));
+  if (isVision || (text.startsWith("/") && camStream)) {
+    const question = text.startsWith("/") ? text.slice(1).trim() : text;
+    sendVision(question);
+  } else {
+    sendText(text);
+  }
+}
+
+function sendText(text) {
+  if (!ws || ws.readyState !== WebSocket.OPEN || !text.trim()) return;
+  addBubble("user", text);
+  inputEl.value = "";
+  currentBot = addBubble("bot", "");
+  currentBot.classList.add("streaming");
+  fullReply = "";
+  setOrb("thinking");
+  ws.send(JSON.stringify({ kind: "text", sessionId: SESSION, message: text, mode: currentMode }));
+}
+
+function sendVision(question) {
+  const img = pendingFrame ?? grabFrame();
+  pendingFrame = null;
+  if (!img) { sendText(question); return; }
+  addBubble("user", `📷 ${question}`);
+  inputEl.value = "";
+  currentBot = addBubble("bot", "");
+  currentBot.classList.add("streaming");
+  fullReply = "";
+  setOrb("thinking");
+  ws.send(JSON.stringify({ kind: "image", sessionId: SESSION, image: img, caption: question, mode: currentMode }));
+}
+
+function handleEvent(ev) {
+  switch (ev.type) {
+    case "token":
+      fullReply += ev.text;
+      if (currentBot) currentBot.textContent = fullReply;
+      scrollBottom();
+      break;
+    case "emotion":
+      emotionEl.innerHTML = `<b>${esc(ev.state)}</b> · ${(+ev.intensity).toFixed(1)}`;
+      break;
+    case "turn_end":
+      if (currentBot) currentBot.classList.remove("streaming");
+      setOrb("");
+      speak(fullReply);
+      if (ev.memoriesStored) addBubble("sys", `${ev.memoriesStored} memory updates saved`);
+      break;
+    case "error":
+      addBubble("sys", `⚠ ${ev.message}`);
+      if (currentBot) currentBot.classList.remove("streaming");
+      setOrb("");
+      break;
+  }
+}
+
+function speak(text) {
+  if (!('speechSynthesis' in window) || !text) return;
+  window.speechSynthesis.cancel();
+  const utter = new SpeechSynthesisUtterance(text);
+  window.speechSynthesis.speak(utter);
+}
+
+$("camBtn").onclick = async () => {
+  if (camStream) {
+    camStream.getTracks().forEach(t => t.stop());
+    camStream = null;
+    video.srcObject = null;
+    $("camPanel").style.display = "none";
+    $("camBtn").classList.remove("active");
+  } else {
+    try {
+      camStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+      video.srcObject = camStream;
+      $("camPanel").style.display = "block";
+      $("camBtn").classList.add("active");
+    } catch (e) {
+      addBubble("sys", `⚠ Camera denied: ${e.message}`);
+    }
+  }
+};
+
+$("modeBtn").onclick = () => {
+  currentMode = currentMode === "safe" ? "mature" : "safe";
+  $("modeBtn").textContent = currentMode === "mature" ? "🔓" : "🔒";
+  addBubble("sys", `Mode switched to: ${currentMode}`);
+};
+
+$("sendBtn").onclick = () => dispatchUserInput(inputEl.value);
+inputEl.onkeydown = (e) => { if (e.key === "Enter") dispatchUserInput(inputEl.value); };
+
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+if (SR) {
+  rec = new SR();
+  rec.continuous = true;
+  rec.interimResults = true;
+  rec.onresult = (e) => {
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const transcript = e.results[i][0].transcript;
+      if (!e.results[i].isFinal) {
+        if (camStream && VISION_PATTERNS.some(p => p.test(transcript)) && !pendingFrame) {
+          pendingFrame = grabFrame();
+          setOrb("listening");
+        }
+      } else {
+        dispatchUserInput(transcript);
+      }
+    }
+  };
+  rec.onend = () => {
+    listening = false;
+    $("micBtn").classList.remove("mic-on");
+    setOrb("");
+  };
+
+  $("micBtn").onclick = () => {
+    if (listening) {
+      rec.stop();
+    } else {
+      rec.start();
+      listening = true;
+      $("micBtn").classList.add("mic-on");
+      setOrb("listening");
+    }
+  };
+} else {
+  $("micBtn").disabled = true;
+}
+
+connect();
+</script>
+</body>
+</html>
+
+5. ⁠server.ts⁠
+TypeScript WebSocket backend with static PWA file serving, Ollama API streaming integration (handling both standard text and vision multimodal base64 inputs), and JSON persistence for long-term user facts and memory.
+import { createServer, IncomingMessage, ServerResponse } from "http";
+import { WebSocketServer, WebSocket } from "ws";
+import * as fs from "fs/promises";
+import * as path from "path";
+
+const PORT = 8081;
+const PUBLIC_DIR = path.join(process.cwd(), "public");
+const DATA_DIR = path.join(process.cwd(), "data");
+const SESSIONS_DIR = path.join(DATA_DIR, "sessions");
+
+const OLLAMA_URL = process.env.OLLAMA_URL || "http://127.0.0.1:11434/api/chat";
+const STANDARD_MODEL = process.env.STANDARD_MODEL || "dolphin3:8b";
+const MATURE_MODEL = process.env.MATURE_MODEL || "dolphin3:8b";
+
+type Turn = { role: "user" | "assistant"; content: string; ts: number; mode?: string };
+type SessionData = { sessionId: string; turns: Turn[]; facts: string[] };
+
+async function readSession(sessionId: string): Promise<SessionData> {
+  const safeId = sessionId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
+  const file = path.join(SESSIONS_DIR, `${safeId}.json`);
+  try {
+    return JSON.parse(await fs.readFile(file, "utf-8"));
+  } catch {
+    return { sessionId, turns: [], facts: [] };
+  }
+}
+
+async function writeSession(data: SessionData): Promise<void> {
+  await fs.mkdir(SESSIONS_DIR, { recursive: true });
+  const safeId = data.sessionId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
+  const file = path.join(SESSIONS_DIR, `${safeId}.json`);
+  const tmp = `${file}.tmp`;
+  await fs.writeFile(tmp, JSON.stringify(data, null, 2));
+  await fs.rename(tmp, file);
+}
+
+async function maybeStoreFact(sessionId: string, text: string): Promise<number> {
+  const patterns = [
+    /\bmy name is ([^.,!?]{2,30})/i,
+    /\bi live in ([^.,!?]{2,40})/i,
+    /\bi (like|hate) ([^.,!?]{3,50})/i
+  ];
+  const s = await readSession(sessionId);
+  let added = 0;
+  for (const p of patterns) {
+    const match = text.match(p);
+    if (match && !s.facts.includes(match[0])) {
+      s.facts.push(match[0]);
+      added++;
+    }
+  }
+  if (added) await writeSession(s);
+  return added;
+}
+
+async function buildSystemPrompt(sessionId: string, mode: string): Promise<string> {
+  const s = await readSession(sessionId);
+  let base = "You are Indigo, a warm, perceptive companion with full memory continuity.";
+  if (mode === "mature") {
+    base += " Explicit mode is unlocked. Match the user's register completely.";
+  }
+  if (s.facts.length > 0) {
+    base += "\nThings you remember about the user:\n- " + s.facts.join("\n- ");
+  }
+  return base;
+}
+
+async function* streamOllamaReply(
+  sessionId: string,
+  message: string,
+  mode: string,
+  imageBase64?: string
+) {
+  const sysPrompt = await buildSystemPrompt(sessionId, mode);
+  const s = await readSession(sessionId);
+  
+  const formattedUserMsg: any = { role: "user", content: message };
+  if (imageBase64) {
+    formattedUserMsg.images = [imageBase64];
+  }
+
+  const messages = [
+    { role: "system", content: sysPrompt },
+    ...s.turns.slice(-20).map(t => ({ role: t.role, content: t.content })),
+    formattedUserMsg
+  ];
+
+  const targetModel = mode === "mature" ? MATURE_MODEL : STANDARD_MODEL;
+
+  const res = await fetch(OLLAMA_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: targetModel, messages, stream: true })
+  });
+
+  if (!res.ok) throw new Error(`Ollama API error: ${res.statusText}`);
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop() ?? "";
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const chunk = JSON.parse(line);
+      if (chunk.message?.content) yield chunk.message.content;
+    }
+  }
+}
+
+// Simple Static HTTP File Server for PWA assets
+const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+  let reqPath = req.url === "/" ? "/index.html" : req.url || "/index.html";
+  const filePath = path.join(PUBLIC_DIR, reqPath);
+  
+  try {
+    const data = await fs.readFile(filePath);
+    const ext = path.extname(filePath);
+    const contentTypes: Record<string, string> = {
+      ".html": "text/html",
+      ".json": "application/json",
+      ".js": "text/javascript",
+      ".css": "text/css"
+    };
+    res.writeHead(200, { "Content-Type": contentTypes[ext] || "text/plain" });
+    res.end(data);
+  } catch {
+    res.writeHead(404);
+    res.end("Not Found");
+  }
+});
+
+const wss = new WebSocketServer({ server });
+
+wss.on("connection", (ws: WebSocket) => {
+  ws.on("message", async (raw: string) => {
+    try {
+      const msg = JSON.parse(String(raw));
+      if (!msg.sessionId) throw new Error("Missing sessionId");
+
+      const sid = msg.sessionId;
+      const mode = msg.mode === "mature" ? "mature" : "safe";
+      const userText = msg.kind === "image" ? (msg.caption || "Describe what you see.") : msg.message;
+      const imagePayload = msg.kind === "image" ? msg.image : undefined;
+      let reply = "";
+
+      ws.send(JSON.stringify({ 
+        type: "emotion", 
+        state: mode === "mature" ? "intimate" : "focused", 
+        intensity: 0.8 
+      }));
+
+      for await (const token of streamOllamaReply(sid, userText, mode, imagePayload)) {
+        reply += token;
+        ws.send(JSON.stringify({ type: "token", text: token }));
+      }
+
+      const s = await readSession(sid);
+      s.turns.push({ role: "user", content: userText, ts: Date.now(), mode });
+      s.turns.push({ role: "assistant", content: reply, ts: Date.now(), mode });
+      await writeSession(s);
+
+      const stored = await maybeStoreFact(sid, userText);
+      ws.send(JSON.stringify({ type: "turn_end", reply, memoriesStored: stored }));
+    } catch (err: any) {
+      ws.send(JSON.stringify({ type: "error", message: err.message || "Execution error" }));
+    }
+  });
+});
+
+server.listen(PORT, "127.0.0.1", () => {
+  console.log(`Indigo application serving at http://127.0.0.1:${PORT}`);
+});
+import { createServer, IncomingMessage, ServerResponse } from "http";
+import { WebSocketServer, WebSocket } from "ws";
+import * as fs from "fs/promises";
+import * as path from "path";
+
+const PORT = 8081;
+const PUBLIC_DIR = path.join(process.cwd(), "public");
+const DATA_DIR = path.join(process.cwd(), "data");
+const SESSIONS_DIR = path.join(DATA_DIR, "sessions");
+
+const OLLAMA_URL = process.env.OLLAMA_URL || "http://127.0.0.1:11434/api/chat";
+const STANDARD_MODEL = process.env.STANDARD_MODEL || "dolphin3:8b";
+const MATURE_MODEL = process.env.MATURE_MODEL || "dolphin3:8b";
+
+type Turn = { role: "user" | "assistant"; content: string; ts: number; mode?: string };
+type SessionData = { sessionId: string; turns: Turn[]; facts: string[] };
+
+async function readSession(sessionId: string): Promise<SessionData> {
+  const safeId = sessionId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
+  const file = path.join(SESSIONS_DIR, `${safeId}.json`);
+  try {
+    return JSON.parse(await fs.readFile(file, "utf-8"));
+  } catch {
+    return { sessionId, turns: [], facts: [] };
+  }
+}
+
+async function writeSession(data: SessionData): Promise<void> {
+  await fs.mkdir(SESSIONS_DIR, { recursive: true });
+  const safeId = data.sessionId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
+  const file = path.join(SESSIONS_DIR, `${safeId}.json`);
+  const tmp = `${file}.tmp`;
+  await fs.writeFile(tmp, JSON.stringify(data, null, 2));
+  await fs.rename(tmp, file);
+}
+
+async function maybeStoreFact(sessionId: string, text: string): Promise<number> {
+  const patterns = [
+    /\bmy name is ([^.,!?]{2,30})/i,
+    /\bi live in ([^.,!?]{2,40})/i,
+    /\bi (like|hate) ([^.,!?]{3,50})/i
+  ];
+  const s = await readSession(sessionId);
+  let added = 0;
+  for (const p of patterns) {
+    const match = text.match(p);
+    if (match && !s.facts.includes(match[0])) {
+      s.facts.push(match[0]);
+      added++;
+    }
+  }
+  if (added) await writeSession(s);
+  return added;
+}
+
+async function buildSystemPrompt(sessionId: string, mode: string): Promise<string> {
+  const s = await readSession(sessionId);
+  let base = "You are Indigo, a warm, perceptive companion with full memory continuity.";
+  if (mode === "mature") {
+    base += " Explicit mode is unlocked. Match the user's register completely.";
+  }
+  if (s.facts.length > 0) {
+    base += "\nThings you remember about the user:\n- " + s.facts.join("\n- ");
+  }
+  return base;
+}
+
+async function* streamOllamaReply(
+  sessionId: string,
+  message: string,
+  mode: string,
+  imageBase64?: string
+) {
+  const sysPrompt = await buildSystemPrompt(sessionId, mode);
+  const s = await readSession(sessionId);
+  
+  const formattedUserMsg: any = { role: "user", content: message };
+  if (imageBase64) {
+    formattedUserMsg.images = [imageBase64];
+  }
+
+  const messages = [
+    { role: "system", content: sysPrompt },
+    ...s.turns.slice(-20).map(t => ({ role: t.role, content: t.content })),
+    formattedUserMsg
+  ];
+
+  const targetModel = mode === "mature" ? MATURE_MODEL : STANDARD_MODEL;
+
+  const res = await fetch(OLLAMA_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: targetModel, messages, stream: true })
+  });
+
+  if (!res.ok) throw new Error(`Ollama API error: ${res.statusText}`);
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop() ?? "";
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const chunk = JSON.parse(line);
+      if (chunk.message?.content) yield chunk.message.content;
+    }
+  }
+}
+
+// Simple Static HTTP File Server for PWA assets
+const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+  let reqPath = req.url === "/" ? "/index.html" : req.url || "/index.html";
+  const filePath = path.join(PUBLIC_DIR, reqPath);
+  
+  try {
+    const data = await fs.readFile(filePath);
+    const ext = path.extname(filePath);
+    const contentTypes: Record<string, string> = {
+      ".html": "text/html",
+      ".json": "application/json",
+      ".js": "text/javascript",
+      ".css": "text/css"
+    };
+    res.writeHead(200, { "Content-Type": contentTypes[ext] || "text/plain" });
+    res.end(data);
+  } catch {
+    res.writeHead(404);
+    res.end("Not Found");
+  }
+});
+
+const wss = new WebSocketServer({ server });
+
+wss.on("connection", (ws: WebSocket) => {
+  ws.on("message", async (raw: string) => {
+    try {
+      const msg = JSON.parse(String(raw));
+      if (!msg.sessionId) throw new Error("Missing sessionId");
+
+      const sid = msg.sessionId;
+      const mode = msg.mode === "mature" ? "mature" : "safe";
+      const userText = msg.kind === "image" ? (msg.caption || "Describe what you see.") : msg.message;
+      const imagePayload = msg.kind === "image" ? msg.image : undefined;
+      let reply = "";
+
+      ws.send(JSON.stringify({ 
+        type: "emotion", 
+        state: mode === "mature" ? "intimate" : "focused", 
+        intensity: 0.8 
+      }));
+
+      for await (const token of streamOllamaReply(sid, userText, mode, imagePayload)) {
+        reply += token;
+        ws.send(JSON.stringify({ type: "token", text: token }));
+      }
+
+      const s = await readSession(sid);
+      s.turns.push({ role: "user", content: userText, ts: Date.now(), mode });
+      s.turns.push({ role: "assistant", content: reply, ts: Date.now(), mode });
+      await writeSession(s);
+
+      const stored = await maybeStoreFact(sid, userText);
+      ws.send(JSON.stringify({ type: "turn_end", reply, memoriesStored: stored }));
+    } catch (err: any) {
+      ws.send(JSON.stringify({ type: "error", message: err.message || "Execution error" }));
+    }
+  });
+});
+
+server.listen(PORT, "127.0.0.1", () =
